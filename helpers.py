@@ -524,6 +524,29 @@ def claim_pending(ref: str, phone: str, decision: str) -> tuple[dict | None, str
         return _copy(p), "OK"
 
 
+def decide_from_portal(ref: str, phone: str, decision: str) -> tuple[dict | None, str]:
+    """
+    EngineeringTeam override from the portal: decide a pending request whoever
+    holds it. Same atomic claim as a WhatsApp tap, so if a ControlRoomAdmin taps
+    at the same moment, exactly one of them wins.
+    Outcomes: OK, UNKNOWN (not in memory, e.g. after a restart), NOT_ENGINEERING_TEAM,
+    or the status it already has.
+    """
+    phone = normalize_phone(phone)
+    with _pending_lock:
+        p = _pending.get(ref)
+        if not p:
+            return None, "UNKNOWN"
+        if phone not in ENGINEERING_TEAM:
+            return None, "NOT_ENGINEERING_TEAM"
+        if p["status"] != "PENDING":
+            return _copy(p), p["status"]
+        p["status"] = decision
+        p["decided_by"] = phone
+        p["decided_by_name"] = ENGINEERING_TEAM[phone]
+        return _copy(p), "OK"
+
+
 def get_pending(ref: str) -> dict | None:
     with _pending_lock:
         p = _pending.get(ref)

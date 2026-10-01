@@ -57,6 +57,7 @@ from helpers import (
     describe_phone,
     engineering_team_role,
     advance_pending,
+    decide_from_portal,
     engineering_team_holders,
     get_pending,
     holder_from_cra,
@@ -581,22 +582,36 @@ async def _handle_approver_button(phone: str, wamid: str, payload: str) -> None:
                                "Nothing more to do.")
         return
 
-    name = p["decided_by_name"]
+    await _carry_out(p, phone, decision, wamid)
+
+
+async def _carry_out(p: dict, phone: str, decision: str, wamid: str = "",
+                     via_portal: bool = False) -> dict:
+    """
+    Act on a decision that claim_pending / decide_from_portal already made final.
+    Shared by WhatsApp taps and the portal. Returns {"result", "error"} for the portal.
+    """
+    ref, name = p["ref"], p["decided_by_name"]
     fm_phone, vehicle_no, action = p["fm_phone"], p["vehicle_no"], p["action"]
     common = dict(phone=fm_phone, fm_id=p["fm_id"], vehicle_no=vehicle_no,
-                  action=action, ref=ref, actor=phone, wamid=wamid)
+                  action=action, ref=ref, actor=phone, wamid=wamid,
+                  detail="from the portal" if via_portal else "")
+    where = " in the portal" if via_portal else ""
+    # On the portal the decider sees the outcome on screen, so no WhatsApp echo to them.
+    reply_to = None if via_portal else phone
 
-    others = p["approvers"] - {phone}
-    for other in others:
+    for other in sorted(p["approvers"] - {phone}):
         await send_text(other, f"ℹ️ {ref} ({action} {vehicle_no}) was "
-                               f"{decision.lower()} by {name}. No action needed.")
+                               f"{decision.lower()} by {name}{where}. Your buttons for it "
+                               "no longer do anything.")
 
     if decision == "REJECTED":
         log_audit(stage="APPROVAL", result="REJECTED", **common)
         await send_text(fm_phone, f"❌ Your request to {VERB[action]} {vehicle_no} "
                                   f"was rejected.\n\nRef: {ref}")
-        await send_text(phone, f"Rejected {ref}. {p['fm_name']} has been told.")
-        return
+        if reply_to:
+            await send_text(reply_to, f"Rejected {ref}. {p['fm_name']} has been told.")
+        return {"result": "", "error": ""}
 
     log_audit(stage="APPROVAL", result="APPROVED", **common)
 
@@ -604,16 +619,19 @@ async def _handle_approver_button(phone: str, wamid: str, payload: str) -> None:
     fm = get_fleet_manager(fm_phone)
     if not fm or not get_owned_vehicle(vehicle_no, fm["fm_id"]):
         log_audit(stage="EXECUTED", result="ABORTED_NOT_OWNED", **common)
-        await send_text(phone, f"⚠️ {ref} not executed: {vehicle_no} is no longer "
-                               f"linked to {p['fm_name']}.")
+        if reply_to:
+            await send_text(reply_to, f"⚠️ {ref} not executed: {vehicle_no} is no longer "
+                                      f"linked to {p['fm_name']}.")
         await send_text(fm_phone, MSG_NOT_YOURS.format(v=vehicle_no))
-        return
+        return {"result": "ABORTED_NOT_OWNED",
+                "error": f"{vehicle_no} is no longer linked to {p['fm_name']}."}
 
     await send_text(fm_phone, f"✅ Approved. Sending {action.lower()} command to {vehicle_no}…")
-    await _execute(p, approver_phone=phone, wamid=wamid)
+    result = await _execute(p, approver_phone=phone, reply_to=reply_to, wamid=wamid)
+    return {"result": "SUCCESS" if result["ok"] else "FAILED", "error": result["error"]}
 
 
-async def _execute(p: dict, *, approver_phone: str, wamid: str) -> None:
+async def _execute(p: dict, *, approver_phone: str, reply_to: str | None, wamid: str) -> dict:
     from helpers import call_vehicle_api  # imported here so it's easy to patch
 
     fm_phone, vehicle_no, action, ref = p["fm_phone"], p["vehicle_no"], p["action"], p["ref"]
@@ -636,7 +654,8 @@ async def _execute(p: dict, *, approver_phone: str, wamid: str) -> None:
             f"Status: {state}\n"
             f"Time:   {now_ist()}\nRef:    {ref}",
         )
-        await send_text(approver_phone, f"✅ {ref} done: {action} on {vehicle_no} succeeded.")
+        if reply_to:
+            await send_text(reply_to, f"✅ {ref} done: {action} on {vehicle_no} succeeded.")
     else:
         await send_text(
             fm_phone,
@@ -644,8 +663,10 @@ async def _execute(p: dict, *, approver_phone: str, wamid: str) -> None:
             "No action was taken. The vehicle may be offline or out of network.\n\n"
             f"Please try again, or contact support.\nRef: {ref}",
         )
-        await send_text(approver_phone, f"⚠️ {ref}: {action} on {vehicle_no} FAILED "
-                                        f"({result['error']}). The FleetManager has been told.")
+        if reply_to:
+            await send_text(reply_to, f"⚠️ {ref}: {action} on {vehicle_no} FAILED "
+                                      f"({result['error']}). The FleetManager has been told.")
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -852,6 +873,32 @@ async def portal_delete_cra(cra_id: str, request: Request):
     log_audit(stage="PORTAL", result="CRA_DELETED", actor=me,
               detail=f"{cra_id} {cra['name']}: was {_describe_cra(cra)}")
     return {"ok": True, **_portal_payload(me)}
+
+
+@app.post("/api/portal/requests/{ref}/decide")
+async def portal_decide(ref: str, request: Request, body: dict):
+    """EngineeringTeam approves or rejects a pending request from the Requests tab."""
+    me = _portal_auth(request)
+    if not me:
+        return _unauthorized()
+    decision = APPROVER_BUTTONS.get(str(body.get("decision", "")).upper())
+    if not decision:
+        return JSONResponse({"error": "Decision must be APPROVE or REJECT."}, status_code=400)
+
+    p, outcome = decide_from_portal(ref, me, decision)
+    if outcome == "UNKNOWN":
+        return JSONResponse({"error": f"{ref} is no longer active (the server restarted or "
+                                      "it already finished). Nothing was done."}, status_code=409)
+    if outcome == "NOT_ENGINEERING_TEAM":
+        return JSONResponse({"error": "Only the EngineeringTeam can decide from the portal."},
+                            status_code=403)
+    if outcome != "OK":
+        who = p["decided_by_name"] or describe_phone(p["decided_by"]) or "the timer"
+        return JSONResponse({"error": f"{ref} was already {outcome.lower()} by {who}. "
+                                      "Nothing more was done."}, status_code=409)
+
+    done = await _carry_out(p, me, decision, via_portal=True)
+    return {"ok": True, "ref": ref, "status": decision, **done}
 
 
 _ROSTER_RESULTS = {"ROSTER_CHANGED", "CRA_ADDED", "CRA_UPDATED", "CRA_DELETED"}

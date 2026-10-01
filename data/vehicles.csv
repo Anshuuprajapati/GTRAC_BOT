@@ -1,7 +1,7 @@
 vehicle_no,fm_id,model,active,status
 HRX1001,FM001,Tata Ace,yes,UNLOCKED
 HRX1002,FM001,Ashok Leyland Dost,yes,LOCKED
-HRX1003,FM001,Mahindra Bolero Pickup,yes,LOCKED
+HRX1003,FM001,Mahindra Bolero Pickup,yes,UNLOCKED
 HRX1004,FM001,Eicher Pro 2049,yes,LOCKED
 HRX1005,FM001,Tata 407,yes,LOCKED
 HRX1006,FM001,Mahindra Jeeto,yes,LOCKED

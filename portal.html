@@ -196,6 +196,7 @@
   .mini li.roster { border-left-color: var(--accent); } .mini li.request { border-left-color: var(--ok); }
   .mini li.signin { border-left-color: var(--info); } .mini li.bad { border-left-color: var(--err); }
   .mini time { font-size: 12px; color: var(--muted); }
+  .decide { display: grid; gap: 10px; }
   .formmsg { font-size: 13.5px; }
   .formmsg.err { color: var(--err); } .formmsg.ok { color: var(--ok); }
 
@@ -306,7 +307,7 @@
           <div class="chips" id="reqFilters"></div>
         </div>
         <div class="tablewrap"><table>
-          <thead><tr><th>Time</th><th>Ref</th><th>FleetManager</th><th>Vehicle</th><th>Action</th><th>Status</th><th>Decided by</th><th>Vehicle result</th></tr></thead>
+          <thead><tr><th>Time</th><th>Ref</th><th>FleetManager</th><th>Vehicle</th><th>Action</th><th>Status</th><th>Decided by</th><th>Decide</th></tr></thead>
           <tbody id="reqRows"></tbody>
         </table></div>
       </section>
@@ -620,9 +621,12 @@
         h("td", { class: "mono" }, r.vehicle_no || "—"), h("td", {}, r.action ? r.action.toLowerCase() : "—"),
         h("td", {}, pill(STATUS[r.status] || [r.status, "mute"]),
           r.handoffs ? h("span", { class: "pill mute", style: "margin-left:6px", title: r.handoffs + " hand-off(s)" }, "↻ " + r.handoffs) : null,
-          r.escalated ? h("span", { class: "pill info", style: "margin-left:6px" }, "Escalated") : null),
-        h("td", {}, r.decided_by_name || "—"),
-        h("td", {}, r.result ? pill(RESULT[r.result] || [r.result, "mute"]) : "—")))
+          r.escalated ? h("span", { class: "pill info", style: "margin-left:6px" }, "Escalated") : null,
+          r.result ? h("span", { style: "margin-left:6px" }, pill(RESULT[r.result] || [r.result, "mute"])) : null),
+        h("td", {}, (r.decided_by_name || "—").replace(" (ControlRoomAdmin)", "")),
+        h("td", {}, r.status === "PENDING" ? h("div", { class: "actions", style: "flex-wrap:nowrap;gap:6px" },
+          h("button", { class: "primary", style: "padding:4px 9px;font-size:13px", onclick: e => { e.stopPropagation(); openPanel({ mode: "request", ref: r.ref, decide: "APPROVE" }); } }, "Approve"),
+          h("button", { class: "danger", style: "padding:4px 9px;font-size:13px", onclick: e => { e.stopPropagation(); openPanel({ mode: "request", ref: r.ref, decide: "REJECT" }); } }, "Reject")) : "")))
       : [h("tr", {}, h("td", { colspan: "8", class: "empty" }, S.requests.length ? "No requests match." : "No requests yet. They appear here as FleetManagers send them."))]));
   }
   $("reqSearch").addEventListener("input", renderRequests);
@@ -649,8 +653,8 @@
       case "ESCALATED_TO_ENGINEERING_TEAM": case "ESCALATED_TO_MVP":
         if ((a.detail || "").startsWith("no answer")) return ["Escalated to the EngineeringTeam: " + a.detail.split(";")[0]];
         return [fm, " asked to " + (VERB[a.action] || act) + " ", veh, " — nobody on shift, escalated to the EngineeringTeam"];
-      case "APPROVED": return [who, " approved " + act + " on ", veh];
-      case "REJECTED": return [who, " rejected " + act + " on ", veh];
+      case "APPROVED": return [who, " approved " + act + " on ", veh, a.detail === "from the portal" ? " in the portal" : ""];
+      case "REJECTED": return [who, " rejected " + act + " on ", veh, a.detail === "from the portal" ? " in the portal" : ""];
       case "EXPIRED": return ["Request to " + act + " ", veh, " expired unanswered", a.detail ? " (" + a.detail + ")" : ""];
       case "NO_APPROVER": return ["No approver was available for ", veh];
       case "SUCCESS": return [act ? act[0].toUpperCase() + act.slice(1) : "Command", " on ", veh, " succeeded"];
@@ -861,9 +865,56 @@
           h("dt", {}, "Hand-offs"), h("dd", {}, r.handoffs ? r.handoffs + " (no answer within " + secs(S.snap.handoff_seconds) + ")" : "None"),
           r.latency_ms ? [h("dt", {}, "Vehicle reply"), h("dd", {}, r.latency_ms + " ms")] : null,
           r.error ? [h("dt", {}, "Error"), h("dd", {}, r.error)] : null),
+        r.status === "PENDING" ? decideBlock(r) : null,
+        r.status === "INTERRUPTED" ? h("div", { class: "note warn" }, "This request was lost when the server restarted, so it can't be decided any more. The FleetManager needs to send it again.") : null,
         h("h3", {}, "Timeline"),
         miniFeed(steps, "No steps recorded.")),
     ];
+  }
+
+  // EngineeringTeam can decide any pending request here, whoever holds it on WhatsApp.
+  function decideBlock(r) {
+    const box = h("div", { class: "decide" });
+    const act = (r.action || "").toLowerCase();
+    const idle = () => {
+      S.panelDirty = false;
+      box.replaceChildren(
+        h("h3", {}, "Decide now"),
+        h("p", { class: "muted", style: "font-size:13px" }, "Decides it immediately, even though it's with " + ((r.sent_to || []).slice(-1)[0] || "someone") + " on WhatsApp. They'll be told it was handled in the portal."),
+        h("div", { class: "actions" },
+          h("button", { class: "primary", onclick: () => confirm("APPROVE") }, "Approve"),
+          h("button", { class: "danger", onclick: () => confirm("REJECT") }, "Reject")));
+    };
+    const confirm = d => {
+      S.panelDirty = true;
+      const approve = d === "APPROVE";
+      const warn = approve && r.action === "PANIC" ? " The horn and lights will go off for 30 seconds and the driver is alerted." : "";
+      const msg = h("div", { class: "formmsg", role: "status" });
+      const yes = h("button", { class: approve ? "primary" : "danger solid", onclick: async () => {
+        yes.disabled = no.disabled = true; msg.className = "formmsg"; msg.textContent = approve ? "Sending the " + act + " command…" : "Rejecting…";
+        try {
+          const res = await api("/api/portal/requests/" + encodeURIComponent(r.ref) + "/decide", { method: "POST", body: JSON.stringify({ decision: d }) });
+          S.panelDirty = false;
+          await loadAll(); renderAll();
+          toast(!approve ? "Rejected " + r.ref + ". The FleetManager has been told."
+                : res.result === "SUCCESS" ? "Approved " + r.ref + ": " + act + " on " + r.vehicle_no + " succeeded."
+                : "Approved " + r.ref + ", but the vehicle command failed" + (res.error ? ": " + res.error : "."));
+        } catch (e) {
+          yes.disabled = no.disabled = false;
+          if (e.message !== "unauthorized") { msg.className = "formmsg err"; msg.textContent = e.message; }
+          if (/already|no longer active/.test(e.message)) { S.panelDirty = false; await loadAll(); renderAll(); toast(e.message); }
+        }
+      } }, approve ? "Yes, approve" : "Yes, reject");
+      const no = h("button", { onclick: idle }, "Cancel");
+      box.replaceChildren(
+        h("div", { class: approve ? "note ok" : "danger-zone", style: "display:grid;gap:10px" },
+          h("b", {}, (approve ? "Approve " : "Reject ") + act + " on " + r.vehicle_no + " for " + (r.fm || "the FleetManager") + "?"),
+          h("span", { style: "font-size:13px" }, approve ? "The command goes to the vehicle straight away." + warn : "Nothing happens to the vehicle; the FleetManager is told it was rejected."),
+          h("div", { class: "actions" }, no, yes), msg));
+    };
+    S.panel.decide ? confirm(S.panel.decide) : idle();
+    S.panel.decide = null;
+    return box;
   }
 
   // ---------- tabs + render all ----------

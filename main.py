@@ -90,7 +90,9 @@ SUCCESS_LINE = {
 
 MSG_UNKNOWN_SENDER = (
     "❌ This number isn't registered as a fleet manager.\n\n"
-    "Contact support to get access."
+    "Contact support to get access.\n\n"
+    "info@gtrac.in\n\n"
+    "Phone: +919999999999"
 )
 MSG_NOT_YOURS = (
     "❌ {v} is not linked to your account.\n\n"
@@ -336,6 +338,7 @@ async def _ask_admin_approval(fm: dict, phone: str, wamid: str,
         f"Action: {action}\n\n"
         f"Ref: {ref}"
     )
+    print(f"[admin] Sending approval request to {ADMIN_PHONE} for {action} on {vehicle_no} (ref: {ref})")
     await send_buttons(
         ADMIN_PHONE,
         admin_msg,

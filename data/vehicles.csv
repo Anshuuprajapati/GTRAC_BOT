@@ -1,5 +1,5 @@
 vehicle_no,fm_id,model,active,status
-HRX1001,FM001,Tata Ace,yes,LOCKED
+HRX1001,FM001,Tata Ace,yes,UNLOCKED
 HRX1002,FM001,Ashok Leyland Dost,yes,LOCKED
 HRX1003,FM001,Mahindra Bolero Pickup,yes,LOCKED
 HRX1004,FM001,Eicher Pro 2049,yes,LOCKED
@@ -44,8 +44,8 @@ HRX5002,FM005,Ashok Leyland Dost,yes,LOCKED
 HRX5003,FM005,Mahindra Bolero Pickup,yes,LOCKED
 HRX5004,FM005,Eicher Pro 2049,yes,LOCKED
 HRX5005,FM005,Tata 407,yes,LOCKED
-HRX5006,FM005,Mahindra Jeeto,yes,LOCKED
-HRX5007,FM005,Ashok Leyland Bada Dost,yes,LOCKED
+HRX5006,FM005,Mahindra Jeeto,yes,UNLOCKED
+HRX5007,FM005,Ashok Leyland Bada Dost,yes,UNLOCKED
 HRX5008,FM005,Tata Intra V30,yes,LOCKED
 HRX5009,FM005,Eicher Pro 2059,yes,LOCKED
 HRX5010,FM005,Maruti Super Carry,yes,LOCKED

@@ -126,16 +126,27 @@ request actions; **ControlRoomAdmins** (12 shift staff) approve them;
 the fallback approvers.
 
 Confirming an action no longer moves the vehicle. It creates a pending request
-(`Ref: REQ-XXXXXX`) and sends Approve / Reject buttons to every active
+(`Ref: REQ-XXXXXX`) and sends Approve / Reject buttons to **one**
 ControlRoomAdmin on the current shift in `data/control_room_admins.csv`
 (3 × 8h shifts in `TIMEZONE`).
 
-- The first decision wins. Later taps are told who already decided, and the
-  vehicle command runs exactly once.
-- Buttons carry only the Ref. The vehicle, action and allowed approvers live
+- **Round-robin.** New requests take turns through the shift in CRA-id order
+  (CRA009 → CRA010 → CRA011 → CRA012 → CRA009…). The portal marks who is NEXT.
+- **Hand-off.** No answer within `APPROVAL_HANDOFF_SECONDS` (default 2 min) →
+  the request passes to the next person on the shift; the previous holder is
+  told and their buttons stop working. Benched or deleted people are skipped.
+- **Escalation.** Once everyone on the shift has had it, the whole
+  EngineeringTeam gets it for `ESCALATION_SECONDS` (default 5 min), then it
+  expires and the FleetManager is told. Nobody on duty → straight to the
+  EngineeringTeam.
+- Turns are tracked by CRA id, not phone, so several ControlRoomAdmins can
+  share one handset and still each get their own turn.
+- Only the current holder can decide, the decision is atomic, and the vehicle
+  command runs exactly once.
+- Buttons carry only the Ref. The vehicle, action and holder live
   server-side, so a payload can't be edited to approve something else.
-- No answer within `APPROVAL_TTL` (default 10 min) → expired, everyone told.
-- Nobody on duty → the request escalates to the `ENGINEERING_TEAM_<ROLE>` numbers.
+- The rotation and pending requests are in memory: a restart starts the
+  rotation from the lowest CRA id again and drops pending requests.
 - Ownership is re-checked at approval time, not just at request time.
 - Pending requests are in memory: a restart drops them and the FleetManager
   has to ask again.
@@ -161,3 +172,9 @@ portal sign-in.
   notification would need an approved template.
 - No rate limiting per manager.
 - `load_data()` is called on `/health`, so it doubles as a config reload.
+
+
+
+
+
+PORTAL_URL=http://127.0.0.1:8077/elockadmins

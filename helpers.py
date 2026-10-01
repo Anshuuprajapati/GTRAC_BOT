@@ -70,7 +70,11 @@ ENABLE_SIMULATE = os.getenv("ENABLE_SIMULATE", "yes" if DRY_RUN else "no").strip
 
 ACTION_TTL = 300    # seconds a "pick an action" prompt stays valid
 CONFIRM_TTL = 120   # seconds a "are you sure?" prompt stays valid
-APPROVAL_TTL = int(os.getenv("APPROVAL_TTL", "600"))  # seconds approvers have to decide
+# Each request goes to ONE ControlRoomAdmin at a time. If they don't answer in
+# HANDOFF_TTL it passes to the next person on the shift; once everyone on the
+# shift has had it, the EngineeringTeam gets ESCALATION_TTL before it expires.
+HANDOFF_TTL = int(os.getenv("APPROVAL_HANDOFF_SECONDS", "120"))
+ESCALATION_TTL = int(os.getenv("ESCALATION_SECONDS", "300"))
 DEDUPE_TTL = 3600   # how long we remember a message id
 
 # Flip UNLOCK/LOCK to False to skip the manager's own "are you sure?" step.
@@ -367,35 +371,131 @@ def approver_name(phone: str) -> str:
 # pending approvals
 #
 # One record per request, keyed by its Ref. The record — not the button
-# payload — says which vehicle and action are being approved and who may
-# approve it, and claiming it is atomic, so two approvers tapping Approve at the
-# same moment produce exactly one vehicle command.
+# payload — says which vehicle and action are being approved and who holds
+# it right now. Exactly one ControlRoomAdmin holds a request at a time (the
+# whole EngineeringTeam once it escalates), and claiming is atomic, so a
+# decision and a hand-off can never both win.
+#
+# Round-robin: each shift+region remembers the last CRA a new request went
+# to, and the next request starts with the following CRA id (wrapping).
+# In memory, so a restart starts the rotation again from the lowest id.
 # --------------------------------------------------------------------------
 _pending: dict[str, dict] = {}
 _pending_lock = Lock()
+_rotation_last: dict[tuple[int, str], str] = {}
+
+STAGE_CRA = "CONTROL_ROOM"
+STAGE_ENG = "ENGINEERING_TEAM"
 
 
-def create_pending(ref: str, *, fm: dict, vehicle_no: str, action: str,
-                   approvers: list[str], shift: int, escalated: bool) -> None:
+def _on_duty_sorted(shift: int, region: str) -> list[dict]:
+    return sorted(get_control_room_admins_for_shift(shift, region), key=lambda c: c["cra_id"])
+
+
+def _after(people: list[dict], cra_id: str) -> list[dict]:
+    """`people` rotated to start just after `cra_id` (by id order, wrapping)."""
+    i = next((n for n, c in enumerate(people) if c["cra_id"] > cra_id), 0) if cra_id else 0
+    return people[i:] + people[:i]
+
+
+def next_in_rotation(shift: int, region: str = DEFAULT_REGION, advance: bool = True) -> dict | None:
+    """The ControlRoomAdmin whose turn it is for a new request, or None if nobody is on duty."""
+    people = _on_duty_sorted(shift, region)
+    if not people:
+        return None
+    with _pending_lock:
+        pick = _after(people, _rotation_last.get((shift, region), ""))[0]
+        if advance:
+            _rotation_last[(shift, region)] = pick["cra_id"]
+    return pick
+
+
+def stage_ttl(p: dict) -> int:
+    return HANDOFF_TTL if p["stage"] == STAGE_CRA else ESCALATION_TTL
+
+
+def holder_from_cra(c: dict) -> dict:
+    return {"cra_id": c["cra_id"], "name": c["name"], "phone": c["phone"]}
+
+
+def engineering_team_holders() -> list[dict]:
+    return [{"cra_id": "", "name": role, "phone": ph} for ph, role in sorted(ENGINEERING_TEAM.items())]
+
+
+def _copy(p: dict, **extra) -> dict:
+    return {**p, "holders": [dict(h) for h in p["holders"]], "approvers": set(p["approvers"]),
+            "tried": list(p["tried"]), "tried_phones": set(p["tried_phones"]), **extra}
+
+
+def create_pending(ref: str, *, fm: dict, vehicle_no: str, action: str, holders: list[dict],
+                   stage: str, shift: int, region: str = DEFAULT_REGION) -> dict:
+    """
+    Holders are tracked by CRA id, not phone: one handset can be shared by
+    several ControlRoomAdmins, and each of them still gets their own turn.
+    Taps are authorised by phone (`approvers` = the holders' phones).
+    """
     now = monotonic()
     with _pending_lock:
         for old in [r for r, p in _pending.items() if now - p["created"] > 86400]:
             _pending.pop(old, None)
-        _pending[ref] = {
+        p = _pending[ref] = {
             "ref": ref,
             "fm_id": fm["fm_id"],
             "fm_name": fm["name"],
             "fm_phone": fm["phone"],
             "vehicle_no": vehicle_no,
             "action": action,
-            "approvers": set(approvers),
+            "holders": [dict(h) for h in holders],    # who holds it right now
+            "approvers": {h["phone"] for h in holders},
+            "tried": [],                               # CRA ids that held it and let it pass
+            "tried_phones": set(),
+            "stage": stage,
             "shift": shift,
-            "escalated": escalated,
+            "region": region,
+            "escalated": stage == STAGE_ENG,
             "status": "PENDING",
             "decided_by": "",
+            "decided_by_name": "",
             "created": now,
-            "expires": now + APPROVAL_TTL,
         }
+        return _copy(p)
+
+
+def advance_pending(ref: str) -> tuple[str, dict] | None:
+    """
+    The current holder(s) didn't answer in time. Move the request on, atomically:
+
+      ("HANDOFF", record)    -> next ControlRoomAdmin on duty now holds it
+      ("ESCALATED", record)  -> everyone on the shift had it; EngineeringTeam holds it
+      ("EXPIRED", record)    -> the EngineeringTeam didn't answer either (or nobody exists)
+
+    Returns None if it was decided in the meantime. `record["previous"]` lists the
+    holders who just lost it. The roster is re-read here, so anyone benched or
+    deleted mid-request is skipped.
+    """
+    with _pending_lock:
+        p = _pending.get(ref)
+        if not p or p["status"] != "PENDING":
+            return None
+        previous = [dict(h) for h in p["holders"]]
+        p["tried_phones"] |= p["approvers"]
+        if p["stage"] == STAGE_CRA:
+            p["tried"].extend(h["cra_id"] for h in previous if h["cra_id"] not in p["tried"])
+            last_id = previous[-1]["cra_id"] if previous else ""
+            people = _after(_on_duty_sorted(get_current_shift(), p["region"]), last_id)
+            nxt = next((c for c in people if c["cra_id"] not in p["tried"]), None)
+            if nxt:
+                p["holders"], kind = [holder_from_cra(nxt)], "HANDOFF"
+            elif ENGINEERING_TEAM:
+                p["holders"], kind = engineering_team_holders(), "ESCALATED"
+                p["stage"], p["escalated"] = STAGE_ENG, True
+            else:
+                p["status"], kind = "EXPIRED", "EXPIRED"
+        else:
+            p["status"], kind = "EXPIRED", "EXPIRED"
+        if p["status"] == "PENDING":
+            p["approvers"] = {h["phone"] for h in p["holders"]}
+        return kind, _copy(p, previous=previous)
 
 
 def claim_pending(ref: str, phone: str, decision: str) -> tuple[dict | None, str]:
@@ -403,44 +503,39 @@ def claim_pending(ref: str, phone: str, decision: str) -> tuple[dict | None, str
     Atomically move a request from PENDING to `decision` (APPROVED/REJECTED).
 
     Returns (record, outcome) where outcome is one of:
-      OK, UNKNOWN (no such ref, e.g. after a restart), NOT_APPROVER,
-      EXPIRED, or the status it already has (APPROVED / REJECTED).
+      OK, UNKNOWN (no such ref, e.g. after a restart), NOT_APPROVER (never sent to them),
+      PASSED_ON (they held it but it moved on), EXPIRED,
+      or the status it already has (APPROVED / REJECTED).
     """
     phone = normalize_phone(phone)
     with _pending_lock:
         p = _pending.get(ref)
         if not p:
             return None, "UNKNOWN"
-        if phone not in p["approvers"]:
+        if phone not in p["approvers"] and phone not in p["tried_phones"]:
             return None, "NOT_APPROVER"
         if p["status"] != "PENDING":
-            return dict(p), p["status"]
-        if p["expires"] < monotonic():
-            p["status"] = "EXPIRED"
-            return dict(p), "EXPIRED"
+            return _copy(p), p["status"]
+        if phone not in p["approvers"]:
+            return _copy(p), "PASSED_ON"
         p["status"] = decision
         p["decided_by"] = phone
-        return dict(p), "OK"
+        p["decided_by_name"] = next(h["name"] for h in p["holders"] if h["phone"] == phone)
+        return _copy(p), "OK"
 
 
-def expire_pending(ref: str) -> dict | None:
-    """Mark as EXPIRED if still undecided. Returns the record if this call expired it."""
+def get_pending(ref: str) -> dict | None:
     with _pending_lock:
         p = _pending.get(ref)
-        if not p or p["status"] != "PENDING":
-            return None
-        p["status"] = "EXPIRED"
-        return dict(p)
+        return _copy(p) if p else None
 
 
 def pending_for_fleet_manager(fm_phone: str) -> dict | None:
     """Most recent undecided request from this manager, if any."""
     fm_phone = normalize_phone(fm_phone)
-    now = monotonic()
     with _pending_lock:
         live = [p for p in _pending.values()
-                if p["fm_phone"] == fm_phone and p["status"] == "PENDING"
-                and p["expires"] > now]
+                if p["fm_phone"] == fm_phone and p["status"] == "PENDING"]
         return dict(max(live, key=lambda p: p["created"])) if live else None
 
 
@@ -572,60 +667,182 @@ def portal_snapshot() -> dict:
                                                         key=lambda a: a["cra_id"])],
         "shifts": [{"shift": s, "label": shift_label(s)} for s in SHIFTS],
         "current_shift": current,
+        # Whose turn the next request in each shift+region would be.
+        "next_up": {f"{s}|{r}": nxt["cra_id"]
+                    for s in SHIFTS
+                    for r in sorted({c["region"] for c in _cras_by_id.values()} | {DEFAULT_REGION})
+                    if (nxt := next_in_rotation(s, r, advance=False))},
+        "handoff_seconds": HANDOFF_TTL,
+        "escalation_seconds": ESCALATION_TTL,
         "timezone": TIMEZONE_STR,
         "server_time": datetime.now(LOCAL_TZ).isoformat(timespec="seconds"),
     }
 
 
-def update_control_room_roster(assignments: list[dict]) -> list[dict]:
-    """
-    Apply shift / region / active changes from the portal to control_room_admins.csv.
+# Every portal write goes through these validators before control_room_admins.csv
+# is touched: a bad value written here would make load_data() raise on the
+# next start and take the bot down.
+def _clean_name(value) -> str:
+    name = " ".join(str(value or "").split())
+    if not 1 <= len(name) <= 60:
+        raise ValueError("Name must be 1 to 60 characters.")
+    if name[0] in "=+-@":
+        # Spreadsheet apps run cells starting with these as formulas.
+        raise ValueError("Name can't start with = + - or @.")
+    return name
 
-    Validates everything before touching the file: a bad value written here
-    would make load_data() raise on the next start and take the bot down.
-    Returns the ControlRoomAdmins whose assignment actually changed.
-    """
+
+def _clean_phone(value) -> str:
+    phone = normalize_phone(str(value or ""))
+    if len(phone) == 10:
+        raise ValueError("Add the country code, e.g. 91 followed by the 10-digit number.")
+    if not 11 <= len(phone) <= 15:
+        raise ValueError("WhatsApp number must be 11 to 15 digits including the country code.")
+    return phone
+
+
+def _clean_shift(value) -> int:
+    try:
+        shift = int(value)
+    except (TypeError, ValueError):
+        shift = 0
+    if shift not in SHIFT_HOURS:
+        raise ValueError(f"Shift must be one of {', '.join(map(str, SHIFTS))}.")
+    return shift
+
+
+def _clean_region(value) -> str:
+    region = str(value or DEFAULT_REGION).strip().upper()
+    if not _REGION_RE.match(region):
+        raise ValueError("Region must be letters, digits, - or _, up to 32 characters.")
+    return region
+
+
+def _clean_active(value) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("Active must be true or false.")
+    return value
+
+
+_CLEANERS = {"name": _clean_name, "phone": _clean_phone, "shift": _clean_shift,
+             "region": _clean_region, "active": _clean_active}
+
+
+def _roster_row(cra: dict) -> dict:
+    return {"cra_id": cra["cra_id"], "name": cra["name"], "phone": cra["phone"],
+            "shift": str(cra["shift"]), "region": cra["region"],
+            "active": "yes" if cra["active"] else "no"}
+
+
+def _read_roster() -> list[dict]:
+    if not CONTROL_ROOM_CSV.exists():
+        return []
+    with CONTROL_ROOM_CSV.open(newline="", encoding="utf-8") as fh:
+        return [_read_cra_row(r, i) for i, r in enumerate(csv.DictReader(fh), start=2)]
+
+
+def _write_roster(roster: list[dict]) -> None:
+    _atomic_write_csv(CONTROL_ROOM_CSV, CRA_FIELDS, [_roster_row(c) for c in roster])
+    load_data()
+
+
+def _check_phone_free(roster: list[dict], phone: str, except_id: str = "") -> None:
+    for c in roster:
+        if c["phone"] == phone and c["cra_id"] != except_id:
+            raise ValueError(f"+{phone} is already on the roster as {c['name']} ({c['cra_id']}).")
+
+
+def add_control_room_admin(data: dict) -> dict:
+    """Validate and append a new ControlRoomAdmin. Returns the stored record."""
+    cra = {
+        "name": _clean_name(data.get("name")),
+        "phone": _clean_phone(data.get("phone")),
+        "shift": _clean_shift(data.get("shift")),
+        "region": _clean_region(data.get("region")),
+        "active": _clean_active(data.get("active", True)),
+    }
     with _control_room_csv_lock:
-        with CONTROL_ROOM_CSV.open(newline="", encoding="utf-8") as fh:
-            rows = list(csv.DictReader(fh))
-        by_id = {r["cra_id"].strip(): r for r in rows}
+        roster = _read_roster()
+        _check_phone_free(roster, cra["phone"])
+        last = max((int(re.sub(r"\D", "", c["cra_id"]) or 0) for c in roster), default=0)
+        cra = {"cra_id": f"CRA{last + 1:03d}", **cra}
+        roster.append(cra)
+        _write_roster(roster)
+    return cra
 
-        changes = []
-        for a in assignments:
-            if not isinstance(a, dict):
-                raise ValueError("each assignment must be an object")
-            cra_id = str(a.get("cra_id", "")).strip()
-            if cra_id not in by_id:
-                raise ValueError(f"unknown cra_id {cra_id!r}")
-            try:
-                shift = int(a.get("shift"))
-            except (TypeError, ValueError):
-                shift = 0
-            if shift not in SHIFT_HOURS:
-                raise ValueError(f"{cra_id}: shift must be one of {SHIFTS}")
-            region = str(a.get("region") or DEFAULT_REGION).strip().upper()
-            if not _REGION_RE.match(region):
-                raise ValueError(f"{cra_id}: region must be letters/digits, max 32")
-            active = a.get("active")
-            if not isinstance(active, bool):
-                raise ValueError(f"{cra_id}: active must be true/false")
 
-            row = by_id[cra_id]
-            new = {"shift": str(shift), "region": region, "active": "yes" if active else "no"}
-            old = {"shift": row.get("shift", "").strip(),
-                   "region": (row.get("region") or DEFAULT_REGION).strip().upper(),
-                   "active": "yes" if _truthy(row.get("active", "yes")) else "no"}
-            if new != old:
-                row.update(new)
-                changes.append({"cra_id": cra_id, "name": row["name"].strip(),
-                                "before": old, "after": new})
+def update_control_room_admin(cra_id: str, changes: dict) -> tuple[dict, dict]:
+    """
+    Apply any of name / phone / shift / region / active to one ControlRoomAdmin.
+    Returns (before, after). Raises LookupError if the id doesn't exist.
+    """
+    unknown = set(changes) - set(_CLEANERS)
+    if unknown:
+        raise ValueError(f"Can't change {', '.join(sorted(unknown))}.")
+    clean = {k: _CLEANERS[k](v) for k, v in changes.items()}
+    with _control_room_csv_lock:
+        roster = _read_roster()
+        cra = next((c for c in roster if c["cra_id"] == cra_id), None)
+        if not cra:
+            raise LookupError(f"No ControlRoomAdmin {cra_id}.")
+        if "phone" in clean:
+            _check_phone_free(roster, clean["phone"], except_id=cra_id)
+        before = dict(cra)
+        cra.update(clean)
+        if cra != before:
+            _write_roster(roster)
+    return before, dict(cra)
 
-        if changes:
-            _atomic_write_csv(CONTROL_ROOM_CSV, CRA_FIELDS, rows)
 
-    if changes:
-        load_data()
-    return changes
+def delete_control_room_admin(cra_id: str) -> dict:
+    """Remove a ControlRoomAdmin from the roster for good. Returns the removed record."""
+    with _control_room_csv_lock:
+        roster = _read_roster()
+        cra = next((c for c in roster if c["cra_id"] == cra_id), None)
+        if not cra:
+            raise LookupError(f"No ControlRoomAdmin {cra_id}.")
+        _write_roster([c for c in roster if c["cra_id"] != cra_id])
+    return cra
+
+
+def describe_phone(phone: str, as_fleet_manager: bool = False) -> str:
+    """
+    Best human label for a number seen in the audit log. One number can be
+    both a FleetManager and EngineeringTeam (Anshu is), so callers say which
+    hat the number was wearing in that row.
+    """
+    phone = normalize_phone(phone)
+    if not phone:
+        return ""
+    role = ENGINEERING_TEAM.get(phone)
+    cra = _cras_by_phone.get(phone) or next(
+        (c for c in _cras_by_id.values() if c["phone"] == phone), None)
+    fm = _managers_by_phone.get(phone)
+    if as_fleet_manager and fm:
+        return fm["name"]
+    if role:
+        return role
+    if cra:
+        return f"{cra['name']} (ControlRoomAdmin)"
+    if fm:
+        return f"{fm['name']} (FleetManager)"
+    return "+" + phone
+
+
+def describe_holder(token: str) -> str:
+    """An audit 'approvers' entry: a CRA id for ControlRoomAdmins, a phone for the EngineeringTeam."""
+    token = token.strip()
+    if token.upper().startswith("CRA"):
+        cra = _cras_by_id.get(token.upper())
+        return f"{cra['name']} (ControlRoomAdmin)" if cra else f"{token} (removed)"
+    return describe_phone(token)
+
+
+def pending_status(ref: str) -> str:
+    """Live status of a request held in memory, or '' if this process never saw it."""
+    with _pending_lock:
+        p = _pending.get(ref)
+        return p["status"] if p else ""
 
 
 # --------------------------------------------------------------------------

@@ -31,7 +31,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from helpers import (
     ACTION_TTL,
     ACTIONS,
-    APPROVAL_TTL,
+    ESCALATION_TTL,
+    HANDOFF_TTL,
+    STAGE_CRA,
+    STAGE_ENG,
     CONFIRM_TTL,
     DRY_RUN,
     ENABLE_SIMULATE,
@@ -42,14 +45,23 @@ from helpers import (
     SHIFTS,
     STATUS_LABEL,
     VERIFY_TOKEN,
+    add_control_room_admin,
     already_seen,
     approver_name,
     claim_pending,
     clear_session,
     create_pending,
+    delete_control_room_admin,
     deny_reason,
+    describe_holder,
+    describe_phone,
     engineering_team_role,
-    expire_pending,
+    advance_pending,
+    engineering_team_holders,
+    get_pending,
+    holder_from_cra,
+    next_in_rotation,
+    stage_ttl,
     get_control_room_admin,
     get_control_room_admins_for_shift,
     get_control_room_admins_on_duty,
@@ -73,6 +85,7 @@ from helpers import (
     now_ist,
     parse_incoming,
     pending_for_fleet_manager,
+    pending_status,
     portal_snapshot,
     portal_user,
     read_audit,
@@ -80,7 +93,7 @@ from helpers import (
     send_text,
     set_session,
     shift_label,
-    update_control_room_roster,
+    update_control_room_admin,
     verify_signature,
 )
 
@@ -396,69 +409,131 @@ async def _expire(fm, phone, wamid, vehicle_no, action, stage) -> None:
 _timers: set[asyncio.Task] = set()  # strong refs, or the event loop may GC them
 
 
+def _minutes(seconds: int) -> str:
+    return f"{seconds // 60} min" if seconds >= 60 and seconds % 60 == 0 else f"{seconds} sec"
+
+
+def _approval_body(p: dict, note: str) -> str:
+    shift_part = "ESCALATED to EngineeringTeam" if p["stage"] == STAGE_ENG else f"Shift {p['shift']}"
+    if p["stage"] == STAGE_ENG:
+        deadline = f"Please answer within {_minutes(ESCALATION_TTL)}, or the request expires."
+    else:
+        deadline = (f"Please answer within {_minutes(HANDOFF_TTL)}. After that it passes "
+                    "to the next ControlRoomAdmin on your shift.")
+    turn = (f"Your turn: {p['holders'][0]['name']} ({p['holders'][0]['cra_id']})\n"
+            if p["stage"] == STAGE_CRA else "")
+    return (f"🔔 Approval request — {shift_part}\n"
+            + turn + (f"{note}\n" if note else "") +
+            f"\nFleetManager: {p['fm_name']} ({p['fm_phone']})\n"
+            f"Vehicle: {p['vehicle_no']}\n"
+            f"Action: {LABEL[p['action']]}\n"
+            f"Sent: {now_ist()}\n\n"
+            f"{deadline}\n\nRef: {p['ref']}")
+
+
+def _holder_ids(holders: list[dict]) -> str:
+    """CRA ids for ControlRoomAdmins, phone numbers for the EngineeringTeam (audit detail)."""
+    return ",".join(h["cra_id"] or h["phone"] for h in holders)
+
+
+def _names(holders: list[dict]) -> str:
+    return ", ".join(h["name"] for h in holders)
+
+
+async def _send_to_holders(p: dict, note: str = "") -> None:
+    body = _approval_body(p, note)
+    for phone in sorted(p["approvers"]):
+        await send_buttons(phone, body, [
+            (f"APPROVE|{p['ref']}", "✅ Approve"),
+            (f"REJECT|{p['ref']}", "❌ Reject"),
+        ])
+
+
 async def _request_approval(fm: dict, phone: str, wamid: str,
                             vehicle_no: str, action: str) -> None:
     clear_session(phone)
     ref = new_ref()
     shift = get_current_shift()
-    on_duty = get_control_room_admins_on_duty()
-    approvers = [a["phone"] for a in on_duty]
-    escalated = not approvers
-    if escalated:
-        approvers = sorted(ENGINEERING_TEAM)
+    first = next_in_rotation(shift)
+    if first:
+        holders, stage = [holder_from_cra(first)], STAGE_CRA
+    else:
+        holders, stage = engineering_team_holders(), STAGE_ENG
 
-    if not approvers:
+    if not holders:
         log_audit(stage="APPROVAL", result="NO_APPROVER", phone=phone, fm_id=fm["fm_id"],
                   vehicle_no=vehicle_no, action=action, wamid=wamid, ref=ref)
         await send_text(phone, "⚠️ No approver is available right now, so no action "
                                f"was taken on {vehicle_no}.\n\nPlease contact support.\nRef: {ref}")
         return
 
-    create_pending(ref, fm=fm, vehicle_no=vehicle_no, action=action,
-                   approvers=approvers, shift=shift, escalated=escalated)
+    p = create_pending(ref, fm=fm, vehicle_no=vehicle_no, action=action,
+                       holders=holders, stage=stage, shift=shift)
     log_audit(stage="APPROVAL",
-              result="ESCALATED_TO_ENGINEERING_TEAM" if escalated else "REQUESTED",
+              result="REQUESTED" if stage == STAGE_CRA else "ESCALATED_TO_ENGINEERING_TEAM",
               phone=phone, fm_id=fm["fm_id"], vehicle_no=vehicle_no, action=action,
-              wamid=wamid, ref=ref, detail=f"shift {shift}; approvers {','.join(approvers)}")
+              wamid=wamid, ref=ref, actor=holders[0]["phone"] if stage == STAGE_CRA else "",
+              detail=(f"shift {shift}, turn of {first['name']} ({first['cra_id']})" if first else
+                      f"shift {shift}, no ControlRoomAdmin on duty")
+                     + f"; approvers {_holder_ids(holders)}")
 
     await send_text(
         phone,
         f"⏳ Your request to {VERB[action]} {vehicle_no} has been sent for approval.\n\n"
         f"You'll get a message here as soon as it's approved or rejected.\nRef: {ref}")
 
-    header = "🔔 Approval request" + (
-        " — ESCALATED (no ControlRoomAdmin on duty)" if escalated else f" — Shift {shift}")
-    body = (f"{header}\n\n"
-            f"FleetManager: {fm['name']} ({phone})\n"
-            f"Vehicle: {vehicle_no}\n"
-            f"Action: {LABEL[action]}\n"
-            f"Requested: {now_ist()}\n"
-            f"Expires in {APPROVAL_TTL // 60} min\n\n"
-            f"Ref: {ref}")
-    for approver in approvers:
-        await send_buttons(approver, body, [
-            (f"APPROVE|{ref}", "✅ Approve"),
-            (f"REJECT|{ref}", "❌ Reject"),
-        ])
+    await _send_to_holders(p, "" if first else "No ControlRoomAdmin is on duty.")
 
-    task = asyncio.create_task(_expire_unanswered(ref))
+    task = asyncio.create_task(_approval_clock(ref))
     _timers.add(task)
     task.add_done_callback(_timers.discard)
 
 
-async def _expire_unanswered(ref: str) -> None:
-    await asyncio.sleep(APPROVAL_TTL)
-    p = expire_pending(ref)
-    if not p:
-        return
-    log_audit(stage="APPROVAL", result="EXPIRED", phone=p["fm_phone"], fm_id=p["fm_id"],
-              vehicle_no=p["vehicle_no"], action=p["action"], ref=ref)
-    await send_text(p["fm_phone"],
-                    f"⏱️ No approver responded in time, so no action was taken on "
-                    f"{p['vehicle_no']}.\n\nSend the vehicle number to try again.\nRef: {ref}")
-    for approver in p["approvers"]:
-        await send_text(approver, f"⌛ {ref} expired unanswered "
-                                  f"({p['action']} {p['vehicle_no']}). No action was taken.")
+async def _approval_clock(ref: str) -> None:
+    """Pass an unanswered request along the shift, then up to the EngineeringTeam, then expire."""
+    p = get_pending(ref)
+    while p and p["status"] == "PENDING":
+        await asyncio.sleep(stage_ttl(p))
+        step = advance_pending(ref)
+        if not step:
+            return  # decided while we waited
+        kind, p = step
+        prev = p["previous"]
+        prev_names = _names(prev)
+        prev_phones = sorted({h["phone"] for h in prev})
+        common = dict(phone=p["fm_phone"], fm_id=p["fm_id"], vehicle_no=p["vehicle_no"],
+                      action=p["action"], ref=ref)
+        waited = _minutes(HANDOFF_TTL if prev and prev[0]["cra_id"] else ESCALATION_TTL)
+
+        if kind == "EXPIRED":
+            log_audit(stage="APPROVAL", result="EXPIRED", **common,
+                      detail=f"no answer from {prev_names or 'anyone'}")
+            await send_text(p["fm_phone"],
+                            f"⏱️ No approver responded in time, so no action was taken on "
+                            f"{p['vehicle_no']}.\n\nSend the vehicle number to try again.\nRef: {ref}")
+            for x in prev_phones:
+                await send_text(x, f"⌛ {ref} expired unanswered ({p['action']} "
+                                   f"{p['vehicle_no']}). No action was taken.")
+            return
+
+        if kind == "HANDOFF":
+            new = p["holders"][0]
+            log_audit(stage="APPROVAL", result="HANDED_OFF", **common, actor=new["phone"],
+                      detail=f"no answer from {prev_names} in {waited}, now {new['name']} "
+                             f"({new['cra_id']}); approvers {_holder_ids(p['holders'])}")
+            note = f"Passed on: {prev_names} didn't answer in {waited}."
+            moved_to = new["name"]
+        else:
+            log_audit(stage="APPROVAL", result="ESCALATED_TO_ENGINEERING_TEAM", **common,
+                      detail=f"no answer from anyone on shift {p['shift']} "
+                             f"(last: {prev_names}); approvers {_holder_ids(p['holders'])}")
+            note = f"Nobody on Shift {p['shift']} answered (last: {prev_names})."
+            moved_to = "the EngineeringTeam"
+        for x in prev_phones:
+            await send_text(x, f"⏭️ {ref}: {prev_names} didn't answer in {waited}, so it "
+                               f"passed to {moved_to}. {prev_names}'s buttons for it no "
+                               "longer work.")
+        await _send_to_holders(p, note)
 
 
 async def _handle_approver_button(phone: str, wamid: str, payload: str) -> None:
@@ -468,6 +543,15 @@ async def _handle_approver_button(phone: str, wamid: str, payload: str) -> None:
         return
     ref = parts[1]
     decision = APPROVER_BUTTONS[parts[0]]
+
+    # Someone removed or benched in the portal after the request went out keeps
+    # the WhatsApp buttons, but must lose the power to use them.
+    if not (get_control_room_admin(phone) or is_engineering_team(phone)):
+        log_audit(stage="APPROVAL", result="DENIED_NOT_ON_ROSTER", ref=ref, actor=phone,
+                  wamid=wamid)
+        await send_text(phone, "❌ You're no longer on the approver roster, so this "
+                               "button can't be used.")
+        return
 
     p, outcome = claim_pending(ref, phone, decision)
 
@@ -485,12 +569,19 @@ async def _handle_approver_button(phone: str, wamid: str, payload: str) -> None:
     if outcome == "EXPIRED":
         await send_text(phone, f"⌛ {ref} has expired. No action was taken.")
         return
+    if outcome == "PASSED_ON":
+        log_audit(stage="APPROVAL", result="DENIED_PASSED_ON", ref=ref, actor=phone, wamid=wamid)
+        await send_text(phone, f"⏭️ Too late: {ref} was already passed to "
+                               f"{_names(p['holders'])} because it wasn't answered in time. "
+                               "No action was taken.")
+        return
     if outcome != "OK":
         await send_text(phone, f"ℹ️ {ref} was already {outcome.lower()} by "
-                               f"{approver_name(p['decided_by'])}. Nothing more to do.")
+                               f"{p['decided_by_name'] or approver_name(p['decided_by'])}. "
+                               "Nothing more to do.")
         return
 
-    name = approver_name(phone)
+    name = p["decided_by_name"]
     fm_phone, vehicle_no, action = p["fm_phone"], p["vehicle_no"], p["action"]
     common = dict(phone=fm_phone, fm_id=p["fm_id"], vehicle_no=vehicle_no,
                   action=action, ref=ref, actor=phone, wamid=wamid)
@@ -686,34 +777,168 @@ async def verify_otp(body: dict):
     return {"ok": True, "token": token}
 
 
+def _portal_payload(me: str) -> dict:
+    return {**portal_snapshot(), "me": me, "role": engineering_team_role(me)}
+
+
+def _bad_request(exc: Exception) -> JSONResponse:
+    status = 404 if isinstance(exc, LookupError) else 400
+    return JSONResponse({"error": str(exc).strip("'\"")}, status_code=status)
+
+
+def _describe_cra(c: dict) -> str:
+    state = "active" if c["active"] else "off roster"
+    return f"+{c['phone']}, shift {c['shift']}, {c['region']}, {state}"
+
+
+def _describe_diff(before: dict, after: dict) -> str:
+    labels = {"name": "name", "phone": "phone", "shift": "shift",
+              "region": "region", "active": "status"}
+    def show(k, v):
+        if k == "active":
+            return "active" if v else "off roster"
+        return f"+{v}" if k == "phone" else str(v)
+    return ", ".join(f"{labels[k]} {show(k, before[k])} → {show(k, after[k])}"
+                     for k in labels if before[k] != after[k])
+
+
 @app.get("/api/portal/data")
 def portal_data(request: Request):
-    phone = _portal_auth(request)
-    if not phone:
+    me = _portal_auth(request)
+    if not me:
         return _unauthorized()
-    return {**portal_snapshot(), "me": phone, "role": engineering_team_role(phone)}
+    return _portal_payload(me)
 
 
-@app.post("/api/portal/roster")
-async def portal_save(request: Request, body: dict):
-    phone = _portal_auth(request)
-    if not phone:
+@app.post("/api/portal/cra")
+async def portal_add_cra(request: Request, body: dict):
+    me = _portal_auth(request)
+    if not me:
         return _unauthorized()
-    assignments = body.get("assignments")
-    if not isinstance(assignments, list) or not assignments:
-        return JSONResponse({"error": "Nothing to save."}, status_code=400)
     try:
-        changes = update_control_room_roster(assignments)
+        cra = add_control_room_admin(body)
     except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
+        return _bad_request(exc)
+    log_audit(stage="PORTAL", result="CRA_ADDED", actor=me,
+              detail=f"{cra['cra_id']} {cra['name']}: {_describe_cra(cra)}")
+    return {"ok": True, "cra": cra, **_portal_payload(me)}
 
-    for c in changes:
-        diff = ", ".join(f"{k} {c['before'][k]}→{c['after'][k]}"
-                         for k in c["after"] if c["before"][k] != c["after"][k])
-        log_audit(stage="PORTAL", result="ROSTER_CHANGED", actor=phone,
-                  detail=f"{c['cra_id']} {c['name']}: {diff}")
-    return {"ok": True, "changed": len(changes), **portal_snapshot(),
-            "me": phone, "role": engineering_team_role(phone)}
+
+@app.patch("/api/portal/cra/{cra_id}")
+async def portal_update_cra(cra_id: str, request: Request, body: dict):
+    me = _portal_auth(request)
+    if not me:
+        return _unauthorized()
+    try:
+        before, after = update_control_room_admin(cra_id, body)
+    except (ValueError, LookupError) as exc:
+        return _bad_request(exc)
+    diff = _describe_diff(before, after)
+    if diff:
+        log_audit(stage="PORTAL", result="CRA_UPDATED", actor=me,
+                  detail=f"{cra_id} {after['name']}: {diff}")
+    return {"ok": True, "changed": bool(diff), "cra": after, **_portal_payload(me)}
+
+
+@app.delete("/api/portal/cra/{cra_id}")
+async def portal_delete_cra(cra_id: str, request: Request):
+    me = _portal_auth(request)
+    if not me:
+        return _unauthorized()
+    try:
+        cra = delete_control_room_admin(cra_id)
+    except LookupError as exc:
+        return _bad_request(exc)
+    log_audit(stage="PORTAL", result="CRA_DELETED", actor=me,
+              detail=f"{cra_id} {cra['name']}: was {_describe_cra(cra)}")
+    return {"ok": True, **_portal_payload(me)}
+
+
+_ROSTER_RESULTS = {"ROSTER_CHANGED", "CRA_ADDED", "CRA_UPDATED", "CRA_DELETED"}
+
+
+def _activity_kind(row: dict) -> str:
+    if row.get("stage") == "PORTAL":
+        return "roster" if row.get("result") in _ROSTER_RESULTS else "signin"
+    if row.get("stage") == "DELIVERY":
+        return "delivery"
+    return "request"
+
+
+@app.get("/api/portal/activity")
+def portal_activity(request: Request, limit: int = 400):
+    """Newest-first audit trail with names resolved, for the Activity view and side panel."""
+    if not _portal_auth(request):
+        return _unauthorized()
+    out = []
+    for r in reversed(read_audit(20000)):
+        r = {k: (v or "") for k, v in r.items()}
+        out.append({
+            "ts": r.get("ts_ist", ""), "kind": _activity_kind(r),
+            "stage": r.get("stage", ""), "result": r.get("result", ""),
+            "ref": r.get("ref", ""), "vehicle_no": r.get("vehicle_no", ""),
+            "action": r.get("action", ""), "fm": describe_phone(r.get("phone", ""), as_fleet_manager=True),
+            "actor": r.get("actor", ""), "actor_name": describe_phone(r.get("actor", "")),
+            "detail": r.get("detail", ""), "error": r.get("error", ""),
+        })
+        if len(out) >= max(1, min(limit, 2000)):
+            break
+    return {"items": out}
+
+
+@app.get("/api/portal/requests")
+def portal_requests(request: Request, limit: int = 300):
+    """One row per FleetManager request (Ref), rebuilt from the audit log."""
+    if not _portal_auth(request):
+        return _unauthorized()
+    reqs: dict[str, dict] = {}
+    for r in read_audit(50000):
+        r = {k: (v or "") for k, v in r.items()}
+        ref = r.get("ref", "")
+        if not ref.startswith("REQ-"):
+            continue
+        q = reqs.setdefault(ref, {
+            "ref": ref, "created": r["ts_ist"], "updated": r["ts_ist"],
+            "fm_phone": "", "vehicle_no": "", "action": "", "status": "PENDING",
+            "escalated": False, "sent_to_phones": [], "handoffs": 0, "decided_by": "", "decided_at": "",
+            "result": "", "error": "", "latency_ms": "", "via_approval": False,
+        })
+        q["updated"] = r["ts_ist"]
+        for k_src, k_dst in (("phone", "fm_phone"), ("vehicle_no", "vehicle_no"), ("action", "action")):
+            if r.get(k_src) and not q[k_dst]:
+                q[k_dst] = r[k_src]
+        stage, res = r.get("stage"), r.get("result")
+        if stage == "APPROVAL":
+            q["via_approval"] = True
+            if res in ("REQUESTED", "HANDED_OFF", "ESCALATED_TO_ENGINEERING_TEAM", "ESCALATED_TO_MVP"):
+                q["escalated"] = q["escalated"] or res.startswith("ESCALATED")
+                q["handoffs"] += res == "HANDED_OFF"
+                detail = r.get("detail", "")
+                if "approvers" in detail:
+                    for ph in detail.split("approvers", 1)[1].split(","):
+                        if ph.strip() and ph.strip() not in q["sent_to_phones"]:
+                            q["sent_to_phones"].append(ph.strip())
+            elif res in ("APPROVED", "REJECTED", "EXPIRED", "NO_APPROVER"):
+                q["status"] = res
+                if res in ("APPROVED", "REJECTED"):
+                    q["decided_by"], q["decided_at"] = r.get("actor", ""), r["ts_ist"]
+        elif stage == "EXECUTED":
+            q["result"], q["error"], q["latency_ms"] = res, r.get("error", ""), r.get("latency_ms", "")
+
+    out = []
+    # A Ref with no FleetManager is just a stray tap on a dead button, not a request.
+    real = [q for q in reqs.values() if q["fm_phone"]]
+    for q in sorted(real, key=lambda q: q["created"], reverse=True)[:max(1, min(limit, 2000))]:
+        q["sent_to"] = [describe_holder(t) for t in q.pop("sent_to_phones")]
+        if not q["via_approval"]:
+            q["status"] = "LEGACY"          # from before approvals existed
+        elif q["status"] == "PENDING":
+            live = pending_status(q["ref"])
+            q["status"] = live if live in ("PENDING", "EXPIRED") else "INTERRUPTED"
+        q["fm"] = describe_phone(q["fm_phone"], as_fleet_manager=True)
+        q["decided_by_name"] = describe_phone(q["decided_by"])
+        out.append(q)
+    return {"items": out}
 
 
 @app.post("/api/portal/logout")

@@ -1,2 +1,10 @@
 venv/
 .env
+__pycache__/
+*.pyc
+*.tmp
+data/audit_log*.csv
+.ai/
+.claude/
+.gemini/
+.codex/

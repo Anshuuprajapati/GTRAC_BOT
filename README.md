@@ -80,7 +80,7 @@ requests.
 - **`call_vehicle_api` in helpers.py** is the only function to rewrite. It
   returns `{ok, status, latency_ms, error}`; keep that shape and nothing else
   changes.
-- **Swap the CSVs for Postgres** by rewriting `load_data`, `get_manager`,
+- **Swap the CSVs for Postgres** by rewriting `load_data`, `get_fleet_manager`,
   `get_owned_vehicle`, `log_audit`. Nothing in `main.py` touches storage.
 - **Sessions and dedupe are in-process.** Run one worker, or move both dicts to
   Redis before scaling out.
@@ -118,7 +118,43 @@ panic isn't.
 `UNLOCK` and `LOCK` to `False` for one-tap if two taps is too slow for a
 manager doing this forty times a day. Keep `PANIC` on.
 
+## Approvals and the roster portal
+
+Who's who (see `whatsapp-vehicle-bot_instructions.md`): **FleetManagers**
+request actions; **ControlRoomAdmins** (12 shift staff) approve them;
+**EngineeringTeam_<ROLE>** (CTO, CEO, PM, HOS…) run the roster portal and are
+the fallback approvers.
+
+Confirming an action no longer moves the vehicle. It creates a pending request
+(`Ref: REQ-XXXXXX`) and sends Approve / Reject buttons to every active
+ControlRoomAdmin on the current shift in `data/control_room_admins.csv`
+(3 × 8h shifts in `TIMEZONE`).
+
+- The first decision wins. Later taps are told who already decided, and the
+  vehicle command runs exactly once.
+- Buttons carry only the Ref. The vehicle, action and allowed approvers live
+  server-side, so a payload can't be edited to approve something else.
+- No answer within `APPROVAL_TTL` (default 10 min) → expired, everyone told.
+- Nobody on duty → the request escalates to the `ENGINEERING_TEAM_<ROLE>` numbers.
+- Ownership is re-checked at approval time, not just at request time.
+- Pending requests are in memory: a restart drops them and the FleetManager
+  has to ask again.
+
+`/elockadmins` is the roster page: WhatsApp-OTP sign-in for the
+`ENGINEERING_TEAM_<ROLE>` numbers in `.env` only; drag ControlRoomAdmins
+between shifts or onto the bench.
+Saves are validated, written atomically to `control_room_admins.csv`, take effect
+immediately, and are audit-logged with who changed what. `/audit` needs a
+portal sign-in.
+
 ## Known gaps for v2
+
+- **Approver and OTP messages are business-initiated.** WhatsApp delivers
+  free-form messages only to people who messaged the bot in the last 24h, so
+  an approver who hasn't will silently miss requests (look for
+  `DELIVERY FAILED ... 131047` in the log). Fix: approved utility template for
+  approval requests and an authentication template for the OTP. Until then,
+  approvers should message the bot at the start of each shift.
 
 - 24-hour window: free-form replies only work within 24h of the manager's last
   message. Fine here since they always message first, but a proactive

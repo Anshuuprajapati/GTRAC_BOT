@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>E-Lock Control Room Roster</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --ink: #1d2330; --muted: #667085;
+    --line: #e3e6eb; --accent: #2f5bea; --accent-ink: #ffffff;
+    --duty: #12805c; --duty-bg: #e7f6ef; --warn: #b54708; --warn-bg: #fff4e5;
+    --err: #b42318; --err-bg: #fdecea; --drop: #eef3ff; --card: #fbfcfd;
+    --s1: #2f5bea; --s2: #12805c; --s3: #b54708;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --panel: #1b2029; --ink: #e8ebf0; --muted: #98a2b3;
+      --line: #2c333f; --accent: #6d8dff; --accent-ink: #0b0e14;
+      --duty: #4cc38a; --duty-bg: #143326; --warn: #f5a524; --warn-bg: #3a2a10;
+      --err: #ff7a6b; --err-bg: #3b1714; --drop: #1f2a44; --card: #222834;
+      --s1: #6d8dff; --s2: #4cc38a; --s3: #f5a524;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); min-height: 100vh;
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--ink); padding: 8px 14px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input { font: inherit; width: 100%; padding: 11px 12px; border: 1px solid var(--line);
+          border-radius: 8px; background: var(--panel); color: var(--ink); }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); }
+  .note { padding: 10px 12px; border-radius: 8px; font-size: 14px; margin-top: 12px; }
+  .note.ok { background: var(--duty-bg); color: var(--duty); }
+  .note.err { background: var(--err-bg); color: var(--err); }
+  .note.warn { background: var(--warn-bg); color: var(--warn); }
+
+  /* sign-in */
+  .login { max-width: 380px; margin: 12vh auto 0; padding: 0 16px; }
+  .login .box { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 28px; }
+  .login h1 { font-size: 22px; margin-bottom: 4px; }
+  .login label { display: block; font-size: 13px; font-weight: 600; margin: 18px 0 6px; }
+  .login button { width: 100%; margin-top: 14px; padding: 11px; }
+
+  /* app */
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 16px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; }
+  header .who { display: flex; gap: 12px; align-items: center; font-size: 14px; }
+  main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 120px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; margin-bottom: 14px; font-size: 14px; }
+
+  .grid { display: grid; gap: 10px; grid-template-columns: 110px repeat(3, minmax(0, 1fr)); }
+  .head { font-weight: 700; font-size: 14px; padding: 10px 12px; border-radius: 10px;
+          background: var(--panel); border: 1px solid var(--line); border-top-width: 4px; }
+  .head .sub { font-weight: 400; color: var(--muted); font-size: 12px; }
+  .head.duty { background: var(--duty-bg); }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .03em;
+           padding: 2px 7px; border-radius: 99px; background: var(--duty); color: var(--panel); margin-left: 6px; }
+  .region { display: flex; align-items: flex-start; padding: 12px 6px; font-weight: 700; font-size: 13px; }
+  .cell, .bench { min-height: 120px; padding: 8px; border-radius: 10px; background: var(--panel);
+                  border: 1px dashed var(--line); display: flex; flex-direction: column; gap: 6px; }
+  .cell.duty { border-color: var(--duty); border-style: solid; }
+  .cell.over, .bench.over, .cell.target, .bench.target { background: var(--drop); border-color: var(--accent); border-style: solid; }
+  .cell .count { font-size: 12px; color: var(--muted); }
+  .cell .count.low { color: var(--warn); font-weight: 600; }
+
+  .chip { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+          padding: 8px 10px; border-radius: 8px; background: var(--card); border: 1px solid var(--line);
+          cursor: grab; user-select: none; touch-action: manipulation; }
+  .chip:active { cursor: grabbing; }
+  .chip.dragging { opacity: .4; }
+  .chip.selected { outline: 2px solid var(--accent); }
+  .chip.changed { border-left: 4px solid var(--accent); }
+  .chip .n { font-weight: 600; font-size: 14px; }
+  .chip .p { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .chip .id { font-size: 11px; color: var(--muted); }
+
+  .benchwrap { margin-top: 18px; }
+  .benchwrap h2 { font-size: 15px; margin-bottom: 6px; }
+  .bench { flex-direction: row; flex-wrap: wrap; min-height: 70px; }
+  .bench .chip { width: 210px; }
+  .addregion { margin-top: 12px; display: flex; gap: 8px; max-width: 380px; }
+
+  .savebar { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 16px; background: var(--panel);
+             border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: center; justify-content: flex-end; }
+  .savebar .msg { margin-right: auto; font-size: 14px; }
+
+  @media (max-width: 760px) {
+    .grid { grid-template-columns: 1fr; }
+    .grid .corner { display: none; }
+    .region { padding: 14px 2px 0; }
+    .cell::before { content: attr(data-label); font-size: 12px; font-weight: 700; color: var(--muted); }
+    .bench .chip { width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<section id="login" class="login">
+  <div class="box">
+    <h1>E-Lock control room roster</h1>
+    <p class="muted">ControlRoomAdmins roster, for the EngineeringTeam only. Sign in with your registered WhatsApp number.</p>
+
+    <form id="phoneForm">
+      <label for="phone">WhatsApp number</label>
+      <input id="phone" type="tel" inputmode="numeric" autocomplete="tel" placeholder="91 98XXX XXXXX" required>
+      <button class="primary" type="submit">Send code</button>
+    </form>
+
+    <form id="otpForm" class="hidden">
+      <label for="otp">6-digit code from WhatsApp</label>
+      <input id="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="\d{6}" required>
+      <button class="primary" type="submit">Sign in</button>
+      <button type="button" id="back">Use a different number</button>
+    </form>
+
+    <div id="loginMsg"></div>
+  </div>
+</section>
+
+<section id="app" class="hidden">
+  <header>
+    <div>
+      <h1>ControlRoomAdmins roster</h1>
+      <div class="muted" style="font-size:13px">Drag a person into a shift. Drop them on the bench to take them off the roster.</div>
+    </div>
+    <div class="who">
+      <span id="clock" class="muted"></span>
+      <span id="me"></span>
+      <button id="logout">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="legend" id="legend"></div>
+    <div class="grid" id="grid"></div>
+
+    <div class="benchwrap">
+      <h2>Off roster <span class="muted" style="font-weight:400">— these ControlRoomAdmins get no approval requests</span></h2>
+      <div class="bench" id="bench" data-shift="" data-region=""></div>
+    </div>
+
+    <form class="addregion" id="regionForm">
+      <input id="regionName" placeholder="New region, e.g. DELHI" maxlength="32">
+      <button type="submit">Add region</button>
+    </form>
+    <p class="muted" style="font-size:13px;margin-top:6px">Requests are routed to region MAIN today. Other regions are saved now and take effect once regional routing is switched on.</p>
+  </main>
+
+  <div class="savebar">
+    <span class="msg" id="saveMsg"></span>
+    <button id="discard" disabled>Discard</button>
+    <button id="save" class="primary" disabled>Save changes</button>
+  </div>
+</section>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const store = {
+    get: k => { try { return sessionStorage.getItem(k); } catch { return null; } },
+    set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
+    del: k => { try { sessionStorage.removeItem(k); } catch {} },
+  };
+
+  let token = store.get("elock_token");
+  let phone = "";
+  let saved = [];       // roster as last loaded from the server
+  let draft = [];       // roster with unsaved edits
+  let snapshot = null;  // shifts, current shift, timezone
+  let extraRegions = [];
+  let selected = null;  // tap-to-move on touch screens
+
+  function note(el, text, kind) {
+    el.replaceChildren();
+    if (!text) return;
+    const d = document.createElement("div");
+    d.className = "note " + kind;
+    d.textContent = text;
+    el.appendChild(d);
+  }
+
+  async function api(path, opts = {}) {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = "Bearer " + token;
+    const res = await fetch(path, { ...opts, headers });
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if (res.status === 401 && path.indexOf("/api/portal/verify-otp") !== 0) {
+      signOut("Your session ended. Please sign in again.");
+      throw new Error("unauthorized");
+    }
+    if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+    return data;
+  }
+
+  // ---------- sign-in ----------
+  $("phoneForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    phone = $("phone").value.replace(/\D/g, "");
+    if (phone.length < 10) return note($("loginMsg"), "Enter the number with country code, e.g. 91…", "err");
+    const btn = e.submitter; btn.disabled = true;
+    try {
+      const r = await api("/api/portal/request-otp", { method: "POST", body: JSON.stringify({ phone }) });
+      note($("loginMsg"), r.message, "ok");
+      $("phoneForm").classList.add("hidden");
+      $("otpForm").classList.remove("hidden");
+      $("otp").focus();
+    } catch (err) { note($("loginMsg"), err.message, "err"); }
+    btn.disabled = false;
+  });
+
+  $("otpForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const btn = e.submitter; btn.disabled = true;
+    try {
+      const r = await api("/api/portal/verify-otp", { method: "POST",
+        body: JSON.stringify({ phone, otp: $("otp").value.trim() }) });
+      token = r.token; store.set("elock_token", token);
+      note($("loginMsg"), "", "");
+      await loadRoster();
+    } catch (err) { note($("loginMsg"), err.message, "err"); }
+    btn.disabled = false;
+  });
+
+  $("back").addEventListener("click", () => {
+    $("otpForm").classList.add("hidden");
+    $("phoneForm").classList.remove("hidden");
+    note($("loginMsg"), "", "");
+  });
+
+  function signOut(message) {
+    token = null; store.del("elock_token");
+    $("app").classList.add("hidden");
+    $("login").classList.remove("hidden");
+    $("otpForm").classList.add("hidden");
+    $("phoneForm").classList.remove("hidden");
+    note($("loginMsg"), message || "", message ? "warn" : "");
+  }
+
+  $("logout").addEventListener("click", async () => {
+    if (dirty() && !confirm("You have unsaved changes. Sign out anyway?")) return;
+    try { await api("/api/portal/logout", { method: "POST" }); } catch {}
+    signOut();
+  });
+
+  // ---------- roster ----------
+  async function loadRoster() {
+    const r = await api("/api/portal/data");
+    accept(r);
+    $("login").classList.add("hidden");
+    $("app").classList.remove("hidden");
+  }
+
+  function accept(r) {
+    snapshot = r;
+    saved = r.control_room_admins.map(a => ({ ...a }));
+    draft = r.control_room_admins.map(a => ({ ...a }));
+    $("me").textContent = "Signed in as " + (r.role || r.me);
+    render();
+  }
+
+  const byId = (list, id) => list.find(a => a.cra_id === id);
+  const changed = a => {
+    const s = byId(saved, a.cra_id);
+    return !s || s.shift !== a.shift || s.region !== a.region || s.active !== a.active;
+  };
+  const dirty = () => draft.some(changed);
+
+  function regions() {
+    const set = new Set(["MAIN", ...extraRegions, ...draft.map(a => a.region)]);
+    return [...set];
+  }
+
+  function chip(a) {
+    const el = document.createElement("div");
+    el.className = "chip" + (changed(a) ? " changed" : "") + (selected === a.cra_id ? " selected" : "");
+    el.draggable = true;
+    el.dataset.id = a.cra_id;
+    el.setAttribute("role", "button");
+    el.setAttribute("tabindex", "0");
+    el.setAttribute("aria-label", a.name + ", tap then tap a shift to move");
+    const left = document.createElement("div");
+    const n = document.createElement("div"); n.className = "n"; n.textContent = a.name;
+    const p = document.createElement("div"); p.className = "p"; p.textContent = "+" + a.phone;
+    left.append(n, p);
+    const id = document.createElement("span"); id.className = "id"; id.textContent = a.cra_id;
+    el.append(left, id);
+
+    el.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", a.cra_id); el.classList.add("dragging"); });
+    el.addEventListener("dragend", () => el.classList.remove("dragging"));
+    el.addEventListener("click", () => { selected = selected === a.cra_id ? null : a.cra_id; render(); });
+    el.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); el.click(); } });
+    return el;
+  }
+
+  function dropZone(el, shift, region) {
+    el.dataset.shift = shift; el.dataset.region = region;
+    el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("over"); });
+    el.addEventListener("dragleave", () => el.classList.remove("over"));
+    el.addEventListener("drop", e => {
+      e.preventDefault(); el.classList.remove("over");
+      move(e.dataTransfer.getData("text/plain"), shift, region);
+    });
+    el.addEventListener("click", e => {
+      if (selected && e.target === el) move(selected, shift, region);
+    });
+    if (selected) el.classList.add("target");
+  }
+
+  function move(id, shift, region) {
+    const a = byId(draft, id);
+    if (!a) return;
+    if (shift === "") { a.active = false; }
+    else { a.active = true; a.shift = Number(shift); a.region = region; }
+    selected = null;
+    render();
+  }
+
+  function render() {
+    const cur = snapshot.current_shift;
+    const colours = ["", "var(--s1)", "var(--s2)", "var(--s3)"];
+
+    const legend = $("legend"); legend.replaceChildren();
+    const tz = document.createElement("span");
+    tz.textContent = "Times in " + snapshot.timezone + ". Shift " + cur + " is on duty now.";
+    legend.append(tz);
+
+    const grid = $("grid"); grid.replaceChildren();
+    const corner = document.createElement("div"); corner.className = "corner"; grid.append(corner);
+    for (const s of snapshot.shifts) {
+      const h = document.createElement("div");
+      h.className = "head" + (s.shift === cur ? " duty" : "");
+      h.style.borderTopColor = colours[s.shift] || "var(--line)";
+      h.textContent = "Shift " + s.shift;
+      if (s.shift === cur) { const b = document.createElement("span"); b.className = "badge"; b.textContent = "ON DUTY"; h.append(b); }
+      const sub = document.createElement("div"); sub.className = "sub"; sub.textContent = s.label;
+      h.append(sub);
+      grid.append(h);
+    }
+
+    for (const region of regions()) {
+      const r = document.createElement("div"); r.className = "region"; r.textContent = region;
+      grid.append(r);
+      for (const s of snapshot.shifts) {
+        const cell = document.createElement("div");
+        cell.className = "cell" + (s.shift === cur && region === "MAIN" ? " duty" : "");
+        cell.dataset.label = region + " · Shift " + s.shift + " (" + s.label + ")";
+        const people = draft.filter(a => a.active && a.shift === s.shift && a.region === region);
+        people.forEach(a => cell.append(chip(a)));
+        const count = document.createElement("div");
+        count.className = "count" + (region === "MAIN" && people.length < 2 ? " low" : "");
+        count.textContent = people.length === 0 ? (region === "MAIN" ? "Nobody — requests escalate to the EngineeringTeam" : "Empty")
+                          : people.length + (people.length === 1 ? " person" : " people");
+        cell.append(count);
+        dropZone(cell, String(s.shift), region);
+        grid.append(cell);
+      }
+    }
+
+    const bench = $("bench"); bench.replaceChildren();
+    const off = draft.filter(a => !a.active);
+    off.forEach(a => bench.append(chip(a)));
+    if (!off.length) { const m = document.createElement("span"); m.className = "muted"; m.textContent = "Nobody"; bench.append(m); }
+    if (!bench.dataset.wired) { dropZone(bench, "", ""); bench.dataset.wired = "1"; }
+    bench.classList.toggle("target", !!selected);
+
+    const n = draft.filter(changed).length;
+    $("save").disabled = !n; $("discard").disabled = !n;
+    $("saveMsg").textContent = selected ? "Now tap the shift to move them into."
+                              : n ? n + " unsaved change" + (n > 1 ? "s" : "") : "";
+  }
+
+  $("discard").addEventListener("click", () => { draft = saved.map(a => ({ ...a })); selected = null; render(); });
+
+  $("save").addEventListener("click", async () => {
+    const btn = $("save"); btn.disabled = true;
+    const assignments = draft.filter(changed).map(a => ({ cra_id: a.cra_id, shift: a.shift, region: a.region, active: a.active }));
+    try {
+      const r = await api("/api/portal/roster", { method: "POST", body: JSON.stringify({ assignments }) });
+      accept(r);
+      $("saveMsg").textContent = "Saved. " + r.changed + " change" + (r.changed === 1 ? "" : "s") + " written to control_room_admins.csv and live now.";
+    } catch (err) {
+      if (err.message !== "unauthorized") $("saveMsg").textContent = "Not saved: " + err.message;
+      render();
+    }
+  });
+
+  $("regionForm").addEventListener("submit", e => {
+    e.preventDefault();
+    const name = $("regionName").value.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+    if (name && !regions().includes(name)) extraRegions.push(name);
+    $("regionName").value = "";
+    render();
+  });
+
+  window.addEventListener("beforeunload", e => { if (dirty()) { e.preventDefault(); e.returnValue = ""; } });
+
+  function tick() {
+    const tzName = snapshot ? snapshot.timezone : undefined;
+    try { $("clock").textContent = new Date().toLocaleTimeString("en-IN", { timeZone: tzName, hour: "2-digit", minute: "2-digit" }); }
+    catch { $("clock").textContent = new Date().toLocaleTimeString(); }
+  }
+  setInterval(tick, 15000); tick();
+  // Re-read the roster every few minutes so the ON DUTY column moves at shift change.
+  setInterval(() => { if (token && !dirty()) loadRoster().catch(() => {}); }, 5 * 60 * 1000);
+
+  if (token) loadRoster().catch(() => signOut());
+})();
+</script>
+</body>
+</html>

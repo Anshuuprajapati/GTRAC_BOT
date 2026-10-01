@@ -5,6 +5,8 @@ test_webhook.py — exercise the bot without WhatsApp.
     python test_webhook.py --url https://xxx.ngrok-free.dev   # through the tunnel
 
 Edit PHONE to a number that exists in data/fleet_managers.csv.
+Steps 4-5 use /simulate, which is only enabled with ENABLE_SIMULATE=yes
+(the default only when WhatsApp credentials are blank).
 """
 
 import argparse
@@ -23,8 +25,8 @@ try:
 except ImportError:
     pass
 
-PHONE = "919812345678"   # must match a row in fleet_managers.csv
-VEHICLE = "HRX1234"      # must belong to that manager
+PHONE = "918882374849"   # must match a row in fleet_managers.csv
+VEHICLE = "HRX1001"      # must belong to that manager
 
 APP_SECRET = os.getenv("APP_SECRET", "").strip()
 

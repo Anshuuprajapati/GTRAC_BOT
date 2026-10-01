@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from helpers import (
     ACTION_TTL,
     ACTIONS,
+    ADMIN_PHONE,
     CONFIRM_TTL,
     DRY_RUN,
     MOCK_VEHICLE_API,
@@ -35,6 +36,7 @@ from helpers import (
     get_status,
     load_data,
     log_audit,
+    looks_like_greeting,
     looks_like_vehicle,
     new_ref,
     now_ist,
@@ -100,6 +102,11 @@ MSG_HELP = (
     "Send me a vehicle number to get started.\n\n"
     "Example: HRX1234\n\n"
     "I can unlock, lock, or trigger the panic alarm on your vehicles."
+)
+MSG_GREETING = (
+    "👋 Hello {name}! 😊\n\n"
+    "Please send the vehicle number to manage.\n\n"
+    "Example: HRX1234"
 )
 MSG_EXPIRED = "⏱️ This request has expired.\n\nPlease send the vehicle number again."
 MSG_CANCELLED = "Cancelled. No action taken on {v}."
@@ -168,6 +175,11 @@ async def _handle_text(fm: dict, phone: str, wamid: str, text: str) -> None:
     """A typed vehicle number always wins — it resets whatever state they were in."""
     word = " ".join(text.lower().split())
 
+    # Handle greetings first
+    if looks_like_greeting(text):
+        await send_text(phone, MSG_GREETING.format(name=fm["name"]))
+        return
+
     # A vehicle number takes priority over everything else.
     if looks_like_vehicle(text):
         vehicle_no = normalize_vehicle(text)
@@ -223,6 +235,25 @@ async def _handle_text(fm: dict, phone: str, wamid: str, text: str) -> None:
 
 async def _handle_button(fm: dict, phone: str, wamid: str, payload: str) -> None:
     parts = payload.split("|")
+
+    # Handle admin approval/rejection buttons
+    if len(parts) >= 2 and parts[0] in ("ADMIN_APPROVE", "ADMIN_REJECT"):
+        if phone != ADMIN_PHONE:
+            await send_text(phone, "❌ You don't have permission to approve/reject requests.")
+            return
+        if len(parts) != 5:
+            await send_text(phone, "❌ Invalid request format.")
+            return
+        kind, fleet_phone, vehicle_no, action, ref = parts[0], parts[1], normalize_vehicle(parts[2]), parts[3], parts[4]
+        if action not in ACTIONS:
+            await send_text(phone, "❌ Invalid action.")
+            return
+        if kind == "ADMIN_APPROVE":
+            await _admin_approve(phone, fleet_phone, vehicle_no, action, ref)
+        else:  # ADMIN_REJECT
+            await _admin_reject(phone, fleet_phone, vehicle_no, action, ref)
+        return
+
     if len(parts) != 3 or parts[1] not in ACTIONS:
         await send_text(phone, MSG_HELP.format(name=fm["name"]))
         return
@@ -274,7 +305,7 @@ async def _handle_button(fm: dict, phone: str, wamid: str, payload: str) -> None
         if not session or session["state"] != "AWAITING_CONFIRM":
             await _expire(fm, phone, wamid, vehicle_no, action, "CONFIRMED")
             return
-        await _execute(fm, phone, wamid, vehicle_no, action)
+        await _ask_admin_approval(fm, phone, wamid, vehicle_no, action)
 
 
 async def _expire(fm, phone, wamid, vehicle_no, action, stage) -> None:
@@ -284,9 +315,112 @@ async def _expire(fm, phone, wamid, vehicle_no, action, stage) -> None:
     await send_text(phone, MSG_EXPIRED)
 
 
+async def _ask_admin_approval(fm: dict, phone: str, wamid: str,
+                              vehicle_no: str, action: str) -> None:
+    """Send approval request to admin."""
+    ref = new_ref()
+    set_session(phone, "AWAITING_ADMIN_APPROVAL", CONFIRM_TTL,
+                vehicle=vehicle_no, action=action, ref=ref, fm_phone=phone)
+
+    log_audit(stage="CONFIRMED", result="PENDING_ADMIN", phone=phone,
+              fm_id=fm["fm_id"], vehicle_no=vehicle_no, action=action,
+              wamid=wamid, ref=ref)
+
+    await send_text(phone, f"⏳ Waiting for admin approval to {action.lower()} {vehicle_no}…")
+
+    admin_msg = (
+        f"🔔 Approval Request\n\n"
+        f"Fleet Manager: {fm['name']}\n"
+        f"Phone: {phone}\n"
+        f"Vehicle: {vehicle_no}\n"
+        f"Action: {action}\n\n"
+        f"Ref: {ref}"
+    )
+    await send_buttons(
+        ADMIN_PHONE,
+        admin_msg,
+        [
+            (f"ADMIN_APPROVE|{phone}|{vehicle_no}|{action}|{ref}", "✅ Approve"),
+            (f"ADMIN_REJECT|{phone}|{vehicle_no}|{action}|{ref}", "❌ Reject"),
+        ],
+    )
+
+
+async def _admin_approve(admin_phone: str, fleet_phone: str, vehicle_no: str,
+                         action: str, ref: str) -> None:
+    """Admin approved the request. Execute the action."""
+    from helpers import call_vehicle_api
+
+    log_audit(stage="ADMIN_APPROVED", result="PENDING", phone=fleet_phone,
+              vehicle_no=vehicle_no, action=action, ref=ref)
+
+    verb = {"UNLOCK": "unlock", "LOCK": "lock", "PANIC": "panic"}[action]
+    await send_text(fleet_phone, f"✅ Approved! Sending {verb} command to {vehicle_no}…")
+
+    result = await call_vehicle_api(action, vehicle_no)
+    clear_session(fleet_phone)
+
+    log_audit(
+        stage="EXECUTED",
+        result="SUCCESS" if result["ok"] else "FAILED",
+        phone=fleet_phone, vehicle_no=vehicle_no, action=action,
+        ref=ref,
+        http_status=str(result["status"]),
+        latency_ms=str(result["latency_ms"]),
+        error=result["error"],
+    )
+
+    if result["ok"]:
+        state = STATUS_LABEL.get(get_status(vehicle_no), "")
+        await send_text(
+            fleet_phone,
+            f"{SUCCESS_LINE[action].format(v=vehicle_no)}\n\n"
+            f"Action: {action.title()}\n"
+            f"Status: {state}\n"
+            f"Time:   {now_ist()}\nRef:    {ref}",
+        )
+        await send_text(
+            admin_phone,
+            f"✅ {action} executed on {vehicle_no}\n"
+            f"Manager: {fleet_phone}\nRef: {ref}",
+        )
+    else:
+        await send_text(
+            fleet_phone,
+            f"⚠️ Couldn't reach {vehicle_no}\n\n"
+            "No action was taken. The vehicle may be offline or out of network.\n\n"
+            f"Please try again, or contact support.\nRef: {ref}",
+        )
+        await send_text(
+            admin_phone,
+            f"⚠️ {action} FAILED on {vehicle_no}\n"
+            f"Manager: {fleet_phone}\nError: {result['error']}\nRef: {ref}",
+        )
+
+
+async def _admin_reject(admin_phone: str, fleet_phone: str, vehicle_no: str,
+                        action: str, ref: str) -> None:
+    """Admin rejected the request."""
+    clear_session(fleet_phone)
+    log_audit(stage="ADMIN_REJECTED", result="REJECTED", phone=fleet_phone,
+              vehicle_no=vehicle_no, action=action, ref=ref)
+
+    await send_text(
+        fleet_phone,
+        f"❌ Admin rejected the request to {action.lower()} {vehicle_no}.\n\n"
+        f"Ref: {ref}",
+    )
+    await send_text(
+        admin_phone,
+        f"❌ You rejected {action} on {vehicle_no}\n"
+        f"Manager: {fleet_phone}\nRef: {ref}",
+    )
+
+
 async def _execute(fm: dict, phone: str, wamid: str,
                    vehicle_no: str, action: str) -> None:
-    from helpers import call_vehicle_api  # imported here so it's easy to patch
+    """Legacy execute function (kept for compatibility)."""
+    from helpers import call_vehicle_api
 
     ref = new_ref()
     log_audit(stage="CONFIRMED", result="PENDING", phone=phone, fm_id=fm["fm_id"],

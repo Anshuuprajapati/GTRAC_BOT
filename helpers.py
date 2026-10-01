@@ -41,6 +41,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "changeme").strip()
 APP_SECRET = os.getenv("APP_SECRET", "").strip()
 GRAPH_VERSION = os.getenv("GRAPH_VERSION", "v21.0").strip()
+ADMIN_PHONE = os.getenv("ADMIN_PHONE", "918882374849").strip()
 
 VEHICLE_API_BASE = os.getenv("VEHICLE_API_BASE", "").strip().rstrip("/")
 VEHICLE_API_KEY = os.getenv("VEHICLE_API_KEY", "").strip()
@@ -90,6 +91,18 @@ def looks_like_vehicle(text: str) -> bool:
     if not re.fullmatch(r"[A-Z0-9]{5,13}", v):
         return False
     return any(c.isalpha() for c in v) and any(c.isdigit() for c in v)
+
+
+def looks_like_greeting(text: str) -> bool:
+    """Detect common greetings: hi, hello, hey, hii, namaste, etc."""
+    word = text.strip().lower()
+    greetings = {
+        "hi", "hello", "hey", "hii", "hiiii", "hiii",
+        "namaste", "salaam", "hey there", "howdy", "yo",
+        "sup", "what's up", "whatsup", "good morning",
+        "good afternoon", "good evening", "hola", "bonjour"
+    }
+    return word in greetings
 
 
 def _truthy(value: str) -> bool:
